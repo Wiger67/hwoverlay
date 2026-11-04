@@ -28,7 +28,12 @@ cargo build --release
 |---|---|
 | Ctrl+Shift+F9 | 顯示 / 隱藏 |
 | Ctrl+Shift+F10 | 換到下一個螢幕角落 |
+| Ctrl+Shift+F11 | 移動模式：視窗出現黃框，可以用滑鼠拖到任何位置（含其他螢幕），靠近邊緣會自動吸附；按右鍵或再按一次 F11 鎖定 |
 | Ctrl+Shift+F12 | 結束程式 |
+
+位置會記在登錄檔 `HKCU\Software\hwoverlay`（值 `Placement`），下次啟動會回到同一個地方；只在位置改變時寫入一次。要重設就刪掉這個機碼。
+
+平常（非移動模式）視窗一樣是滑鼠穿透的，不會擋到遊戲的點擊。
 
 `hwoverlay.exe --dump` 會在終端機印出 3 次數值，方便除錯。
 

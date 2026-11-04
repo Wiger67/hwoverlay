@@ -3,15 +3,18 @@
 //! Hotkeys:
 //!   Ctrl+Shift+F9   show / hide
 //!   Ctrl+Shift+F10  move to next screen corner
+//!   Ctrl+Shift+F11  move mode: drag with the mouse, right-click or F11 again to lock
 //!   Ctrl+Shift+F12  quit
 
 #![windows_subsystem = "windows"]
 
+mod config;
 mod pdh;
 mod stats;
 
 use std::cell::RefCell;
 
+use config::Placement;
 use stats::{Snapshot, Stats};
 use windows::core::w;
 use windows::Win32::Foundation::*;
@@ -27,10 +30,13 @@ const OPACITY: u8 = 200; // 0..=255, whole window
 const FONT_PX: f32 = 15.0;
 const MARGIN_PX: f32 = 10.0;
 const PAD_PX: f32 = 6.0;
+const SNAP_PX: f32 = 16.0; // while dragging, stick to the screen margin when this close
+const BORDER_PX: f32 = 2.0; // move-mode outline
 
 const HK_TOGGLE: i32 = 1;
 const HK_CORNER: i32 = 2;
 const HK_QUIT: i32 = 3;
+const HK_MOVE: i32 = 4;
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
@@ -50,8 +56,12 @@ struct App {
     lines: Vec<Line>,
     font: HFONT,
     scale: f32,
-    corner: u8, // 0 TL, 1 TR, 2 BR, 3 BL
+    placement: Placement,
     visible: bool,
+    /// Move mode: window accepts the mouse (not click-through) and can be dragged.
+    moving: bool,
+    /// While dragging: cursor offset from the window's top-left corner.
+    drag: Option<POINT>,
 }
 
 thread_local! {
@@ -116,8 +126,10 @@ fn main() -> windows::core::Result<()> {
                 lines: Vec::new(),
                 font,
                 scale,
-                corner: 0,
+                placement: config::load(),
                 visible: true,
+                moving: false,
+                drag: None,
             })
         });
 
@@ -141,6 +153,7 @@ fn main() -> windows::core::Result<()> {
         let mods = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
         let _ = RegisterHotKey(hwnd, HK_TOGGLE, mods, VK_F9.0 as u32);
         let _ = RegisterHotKey(hwnd, HK_CORNER, mods, VK_F10.0 as u32);
+        let _ = RegisterHotKey(hwnd, HK_MOVE, mods, VK_F11.0 as u32);
         let _ = RegisterHotKey(hwnd, HK_QUIT, mods, VK_F12.0 as u32);
 
         SetTimer(hwnd, 1, REFRESH_MS, None);
@@ -170,19 +183,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ERASEBKGND => LRESULT(1),
         WM_HOTKEY => {
             match wparam.0 as i32 {
-                HK_TOGGLE => with_app(|app| {
-                    app.visible = !app.visible;
-                    let _ = ShowWindow(hwnd, if app.visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
-                }),
+                HK_TOGGLE => {
+                    let visible = with_app(|app| {
+                        app.visible = !app.visible;
+                        app.visible
+                    });
+                    if !visible {
+                        set_move_mode(hwnd, false); // don't leave a hidden window catching clicks
+                    }
+                    let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+                }
                 HK_CORNER => {
-                    with_app(|app| app.corner = (app.corner + 1) % 4);
+                    let p = with_app(|app| {
+                        app.placement = app.placement.next_corner();
+                        app.placement
+                    });
+                    config::save(p);
                     tick(hwnd);
                 }
+                HK_MOVE => set_move_mode(hwnd, !with_app(|app| app.moving)),
                 HK_QUIT => {
                     let _ = DestroyWindow(hwnd);
                 }
                 _ => {}
             }
+            LRESULT(0)
+        }
+        // ----- move mode only; while click-through the window never sees the mouse -----
+        WM_SETCURSOR => {
+            let _ = SetCursor(LoadCursorW(None, IDC_SIZEALL).unwrap_or_default());
+            LRESULT(1)
+        }
+        WM_LBUTTONDOWN => {
+            let mut cur = POINT::default();
+            let mut rc = RECT::default();
+            let _ = GetCursorPos(&mut cur);
+            let _ = GetWindowRect(hwnd, &mut rc);
+            with_app(|app| app.drag = Some(POINT { x: cur.x - rc.left, y: cur.y - rc.top }));
+            SetCapture(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            drag_to_cursor(hwnd);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            // ReleaseCapture sends WM_CAPTURECHANGED synchronously, so don't hold the APP borrow across it.
+            let _ = ReleaseCapture();
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            let p = with_app(|app| app.drag.take().map(|_| app.placement));
+            if let Some(p) = p {
+                config::save(p);
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            set_move_mode(hwnd, false);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -199,25 +257,89 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> R {
 
 /// Refresh stats, resize/reposition the window to fit, and repaint.
 unsafe fn tick(hwnd: HWND) {
-    let (w, h, corner, scale) = with_app(|app| {
+    let (w, h, placement, scale) = with_app(|app| {
         let snap = app.stats.sample();
         app.lines = build_lines(&snap);
         let (w, h) = measure(app);
-        (w, h, app.corner, app.scale)
+        (w, h, app.placement, app.scale)
     });
 
-    let sw = GetSystemMetrics(SM_CXSCREEN);
-    let sh = GetSystemMetrics(SM_CYSCREEN);
     let m = (MARGIN_PX * scale) as i32;
-    let (x, y) = match corner {
-        0 => (m, m),
-        1 => (sw - w - m, m),
-        2 => (sw - w - m, sh - h - m),
-        _ => (m, sh - h - m),
+    let (x, y) = match placement {
+        Placement::Corner(c) => {
+            let sw = GetSystemMetrics(SM_CXSCREEN);
+            let sh = GetSystemMetrics(SM_CYSCREEN);
+            match c {
+                0 => (m, m),
+                1 => (sw - w - m, m),
+                2 => (sw - w - m, sh - h - m),
+                _ => (m, sh - h - m),
+            }
+        }
+        // Clamp so a saved spot on a since-unplugged monitor (or a wider layout) stays on screen.
+        Placement::Free { x, y } => {
+            let mon = monitor_rect(x, y);
+            (x.clamp(mon.left, (mon.right - w).max(mon.left)), y.clamp(mon.top, (mon.bottom - h).max(mon.top)))
+        }
     };
     // Re-assert topmost every tick: some games push themselves above other topmost windows.
     let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     let _ = InvalidateRect(hwnd, None, false);
+}
+
+/// Full bounds of the monitor nearest to (x, y).
+unsafe fn monitor_rect(x: i32, y: i32) -> RECT {
+    let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let _ = GetMonitorInfoW(mon, &mut mi);
+    mi.rcMonitor
+}
+
+/// Toggle move mode by flipping WS_EX_TRANSPARENT (click-through) on and off.
+unsafe fn set_move_mode(hwnd: HWND, on: bool) {
+    let changed = with_app(|app| {
+        let changed = app.moving != on;
+        app.moving = on;
+        if on && !app.visible {
+            app.visible = true;
+        }
+        changed
+    });
+    if !changed {
+        return;
+    }
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let ex = if on { ex & !(WS_EX_TRANSPARENT.0 as isize) } else { ex | WS_EX_TRANSPARENT.0 as isize };
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+    if on {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    } else {
+        let _ = ReleaseCapture(); // saves position via WM_CAPTURECHANGED if a drag was in progress
+    }
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
+/// Follow the cursor while dragging, snapping to the screen margin near edges.
+unsafe fn drag_to_cursor(hwnd: HWND) {
+    let Some((off, scale)) = with_app(|app| app.drag.map(|d| (d, app.scale))) else {
+        return;
+    };
+    let mut cur = POINT::default();
+    let mut rc = RECT::default();
+    let _ = GetCursorPos(&mut cur);
+    let _ = GetWindowRect(hwnd, &mut rc);
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    let (mut x, mut y) = (cur.x - off.x, cur.y - off.y);
+
+    let mon = monitor_rect(cur.x, cur.y);
+    let m = (MARGIN_PX * scale) as i32;
+    let snap = (SNAP_PX * scale) as i32;
+    let stick = |v: i32, target: i32| if (v - target).abs() <= snap { target } else { v };
+    x = stick(stick(x, mon.left + m), mon.right - w - m);
+    y = stick(stick(y, mon.top + m), mon.bottom - h - m);
+
+    with_app(|app| app.placement = Placement::Free { x, y });
+    let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 unsafe fn measure(app: &App) -> (i32, i32) {
@@ -275,6 +397,20 @@ unsafe fn paint(hwnd: HWND) {
             }
         }
         SelectObject(mem, old_font);
+
+        if app.moving {
+            let b = ((BORDER_PX * app.scale) as i32).max(1);
+            let brush = CreateSolidBrush(WARN);
+            for edge in [
+                RECT { right: b, ..rc },
+                RECT { left: rc.right - b, ..rc },
+                RECT { bottom: b, ..rc },
+                RECT { top: rc.bottom - b, ..rc },
+            ] {
+                FillRect(mem, &edge, brush);
+            }
+            let _ = DeleteObject(brush);
+        }
     });
 
     let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);

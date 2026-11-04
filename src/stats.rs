@@ -84,7 +84,10 @@ impl Stats {
         let query = Query::new().expect("PdhOpenQuery failed");
         let add = |on: bool, path: &str| if on { query.add(path) } else { None };
 
-        let cpu = add(want_cpu, r"\Processor Information(_Total)\% Processor Utility")
+        // "% Processor Time" = how busy the CPU is, never above 100%. This is what Task Manager's
+        // Performance tab shows since the 2025 Windows 11 update. ("% Processor Utility" also scales
+        // by clock speed vs. base clock, so it reads higher under boost and can exceed 100%.)
+        let cpu = add(want_cpu, r"\Processor Information(_Total)\% Processor Time")
             .or_else(|| add(want_cpu, r"\Processor(_Total)\% Processor Time"));
         // RAPL package power in milliwatts (Intel, and AMD on recent Windows builds).
         let cpu_power = add(want_cpu || want_power, r"\Energy Meter(RAPL_Package0_PKG)\Power");

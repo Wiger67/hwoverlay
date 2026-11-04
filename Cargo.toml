@@ -7,6 +7,10 @@ description = "Lightweight always-on-top hardware overlay for gaming (CPU/GPU/RA
 [dependencies]
 nvml-wrapper = "0.10"
 
+# Build-time only: compiles hwoverlay.rc (the exe icon) with rc.exe / windres. Adds no runtime code.
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies.windows]
 version = "0.58"
 features = [

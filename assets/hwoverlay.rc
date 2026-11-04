@@ -1,0 +1,4 @@
+// Exe icon (what Explorer, shortcuts and the Startup folder show).
+// Compiled by build.rs; paths are relative to the crate root, where cargo runs the build.
+// The window itself has no icon: it is a tool window with no taskbar button.
+1 ICON "assets/hwoverlay.ico"

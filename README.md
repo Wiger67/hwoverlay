@@ -18,7 +18,9 @@
 cargo build --release
 ```
 
-產出 `target/release/hwoverlay.exe`（約 370 KB）。
+產出 `target/release/hwoverlay.exe`（約 400 KB）。
+
+exe 的 icon 由 `build.rs` 在編譯時嵌入（`assets/hwoverlay.ico`，需要 Windows SDK 的 `rc.exe`，裝 Rust MSVC 工具鏈時通常已經有了）。找不到資源編譯器時一樣能編譯，只是沒有 icon。icon 的原始設計在 `assets/icon.svg`（大尺寸）和 `assets/icon-small.svg`（32px 以下用，線條加粗）。
 
 ## 使用
 

@@ -4,7 +4,7 @@
 
 | 項目 | 來源 |
 |---|---|
-| CPU 使用率 | PDH `Processor Information\% Processor Utility`（與工作管理員一致） |
+| CPU 使用率 | PDH `Processor Information\% Processor Time`（CPU 有多忙，與新版工作管理員「效能」分頁一致） |
 | CPU 功耗 | PDH `Energy Meter(RAPL_Package0_PKG)\Power` |
 | CPU 溫度 | PDH `Thermal Zone Information(*)\High Precision Temperature`（ACPI 熱區，取最高的那個） |
 | GPU 使用率 / 功耗 / 溫度 / VRAM | NVIDIA NVML（驅動內建 `nvml.dll`）；非 NVIDIA 時改用 PDH `GPU Engine` 只顯示使用率 |

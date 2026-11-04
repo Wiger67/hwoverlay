@@ -28,16 +28,41 @@ cargo build --release
 |---|---|
 | Ctrl+Shift+F9 | 顯示 / 隱藏 |
 | Ctrl+Shift+F10 | 換到下一個螢幕角落 |
-| Ctrl+Shift+F11 | 移動模式：視窗出現黃框，可以用滑鼠拖到任何位置（含其他螢幕），靠近邊緣會自動吸附；按右鍵或再按一次 F11 鎖定 |
+| Ctrl+Shift+F11 | 移動模式：視窗出現黃框，可以用滑鼠拖到任何位置（含其他螢幕），靠近邊緣會自動吸附；**按右鍵開設定選單**；再按一次 F11 鎖定 |
 | Ctrl+Shift+F12 | 結束程式 |
-
-位置會記在登錄檔 `HKCU\Software\hwoverlay`（值 `Placement`），下次啟動會回到同一個地方；只在位置改變時寫入一次。要重設就刪掉這個機碼。
 
 平常（非移動模式）視窗一樣是滑鼠穿透的，不會擋到遊戲的點擊。
 
+### 設定（右鍵選單 / hwoverlay.ini）
+
+在移動模式（Ctrl+Shift+F11）下對視窗按右鍵：
+
+- 勾選要顯示的項目：CPU、GPU、VRAM、RAM、網路、功耗。**取消勾選的項目連資料都不會讀取**，例如關掉 GPU 就不會呼叫 NVML，所以關越多越省資源。
+- **橫排顯示**：改成一行精簡版，例如
+  `CPU  23%  55°C │ GPU  41%  63°C │ RAM  48% │ ↓ 1.2M ↑  85K │ PWR  77W`
+  （橫排省略 GB 明細和各晶片瓦數，只留主要數字）
+- 鎖定位置
+
+所有設定（含位置）都存在 exe 旁邊的 `hwoverlay.ini`，第一次執行會自動產生，只有設定改變時才寫入。也可以用記事本直接改，改完按 Ctrl+Shift+F11 進入移動模式就會重新讀取：
+
+```ini
+[display]
+horizontal=0
+cpu=1
+gpu=1
+vram=1
+ram=1
+net=1
+power=1
+[window]
+position=corner 0
+```
+
+`position` 是 `corner 0`～`corner 3`（左上、右上、右下、左下），或拖曳後的 `pos X Y`。刪掉 ini 就回到預設值。如果 exe 放在沒有寫入權限的資料夾（例如 Program Files），設定不會被記住。
+
 `hwoverlay.exe --dump` 會在終端機印出 3 次數值，方便除錯。
 
-字體大小、透明度、更新頻率、顏色都在 `src/main.rs` 最上面的常數改。
+字體大小、透明度、更新頻率、顏色還是在 `src/main.rs` 最上面的常數改。
 
 ## 注意
 

@@ -3,8 +3,10 @@
 //! Hotkeys:
 //!   Ctrl+Shift+F9   show / hide
 //!   Ctrl+Shift+F10  move to next screen corner
-//!   Ctrl+Shift+F11  move mode: drag with the mouse, right-click or F11 again to lock
+//!   Ctrl+Shift+F11  move mode: drag with the mouse, right-click for the settings menu, F11 again to lock
 //!   Ctrl+Shift+F12  quit
+//!
+//! Settings (items shown, horizontal layout, position) live in `hwoverlay.ini` next to the exe.
 
 #![windows_subsystem = "windows"]
 
@@ -14,9 +16,9 @@ mod stats;
 
 use std::cell::RefCell;
 
-use config::Placement;
+use config::{Item, Placement, Settings};
 use stats::{Snapshot, Stats};
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -38,6 +40,11 @@ const HK_CORNER: i32 = 2;
 const HK_QUIT: i32 = 3;
 const HK_MOVE: i32 = 4;
 
+// Move-mode right-click menu
+const ID_ITEM: usize = 100; // + Item index
+const ID_HORIZONTAL: usize = 200;
+const ID_LOCK: usize = 201;
+
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
 }
@@ -53,10 +60,12 @@ type Line = Vec<(String, COLORREF)>;
 
 struct App {
     stats: Stats,
+    settings: Settings,
+    /// Last sample, kept so a settings change can re-layout without sampling early.
+    snap: Snapshot,
     lines: Vec<Line>,
     font: HFONT,
     scale: f32,
-    placement: Placement,
     visible: bool,
     /// Move mode: window accepts the mouse (not click-through) and can be dragged.
     moving: bool,
@@ -71,10 +80,11 @@ thread_local! {
 fn main() -> windows::core::Result<()> {
     // `hwoverlay --dump | more` prints a few samples as text instead of showing the overlay.
     if std::env::args().any(|a| a == "--dump") {
-        let stats = Stats::new();
+        let settings = config::load();
+        let stats = Stats::new(&settings);
         for _ in 0..3 {
             std::thread::sleep(std::time::Duration::from_millis(REFRESH_MS as u64));
-            for line in build_lines(&stats.sample()) {
+            for line in build_lines(&stats.sample(), &settings) {
                 println!("{}", line.iter().map(|(s, _)| s.as_str()).collect::<String>());
             }
             println!();
@@ -120,13 +130,15 @@ fn main() -> windows::core::Result<()> {
             w!("Consolas"),
         );
 
+        let settings = config::load();
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
-                stats: Stats::new(),
+                stats: Stats::new(&settings),
+                settings,
+                snap: Snapshot::default(),
                 lines: Vec::new(),
                 font,
                 scale,
-                placement: config::load(),
                 visible: true,
                 moving: false,
                 drag: None,
@@ -194,12 +206,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
                 }
                 HK_CORNER => {
-                    let p = with_app(|app| {
-                        app.placement = app.placement.next_corner();
-                        app.placement
+                    let s = with_app(|app| {
+                        app.settings.placement = app.settings.placement.next_corner();
+                        app.settings
                     });
-                    config::save(p);
-                    tick(hwnd);
+                    config::save(&s);
+                    layout(hwnd);
                 }
                 HK_MOVE => set_move_mode(hwnd, !with_app(|app| app.moving)),
                 HK_QUIT => {
@@ -233,14 +245,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            let p = with_app(|app| app.drag.take().map(|_| app.placement));
-            if let Some(p) = p {
-                config::save(p);
+            let s = with_app(|app| app.drag.take().map(|_| app.settings));
+            if let Some(s) = s {
+                config::save(&s);
             }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            set_move_mode(hwnd, false);
+            show_menu(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -255,13 +267,18 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> R {
     APP.with(|a| f(a.borrow_mut().as_mut().expect("app not initialised")))
 }
 
-/// Refresh stats, resize/reposition the window to fit, and repaint.
+/// Sample the hardware, then re-layout.
 unsafe fn tick(hwnd: HWND) {
+    with_app(|app| app.snap = app.stats.sample());
+    layout(hwnd);
+}
+
+/// Rebuild the text from the last sample, resize/reposition the window to fit, and repaint.
+unsafe fn layout(hwnd: HWND) {
     let (w, h, placement, scale) = with_app(|app| {
-        let snap = app.stats.sample();
-        app.lines = build_lines(&snap);
+        app.lines = build_lines(&app.snap, &app.settings);
         let (w, h) = measure(app);
-        (w, h, app.placement, app.scale)
+        (w, h, app.settings.placement, app.scale)
     });
 
     let m = (MARGIN_PX * scale) as i32;
@@ -295,8 +312,63 @@ unsafe fn monitor_rect(x: i32, y: i32) -> RECT {
     mi.rcMonitor
 }
 
+/// Switch to new settings: only rebuild the counters if the set of items changed.
+unsafe fn apply_settings(hwnd: HWND, new: Settings, save: bool) {
+    with_app(|app| {
+        if !new.same_items(&app.settings) {
+            app.stats = Stats::new(&new);
+        }
+        app.settings = new;
+    });
+    if save {
+        config::save(&new);
+    }
+    layout(hwnd);
+}
+
+/// Move-mode right-click menu: pick the items to show, layout, or lock.
+unsafe fn show_menu(hwnd: HWND) {
+    // Copy, not a borrow: the menu runs a modal loop that keeps delivering WM_TIMER ticks.
+    let s = with_app(|app| app.settings);
+    let Ok(menu) = CreatePopupMenu() else {
+        return;
+    };
+    let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED };
+    for (i, item) in Item::ALL.into_iter().enumerate() {
+        let _ = AppendMenuW(menu, check(s.shows(item)), ID_ITEM + i, item.menu_label());
+    }
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, check(s.horizontal), ID_HORIZONTAL, w!("橫排顯示"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, ID_LOCK, w!("鎖定位置\tCtrl+Shift+F11"));
+
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    // A popup menu only closes on an outside click if its owner is the foreground window.
+    let _ = SetForegroundWindow(hwnd);
+    let flags = TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON;
+    let cmd = TrackPopupMenu(menu, flags, pt.x, pt.y, 0, hwnd, None).0 as usize;
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    let _ = DestroyMenu(menu);
+
+    let mut new = s;
+    match cmd {
+        ID_LOCK => return set_move_mode(hwnd, false),
+        ID_HORIZONTAL => new.horizontal ^= true,
+        c if (ID_ITEM..ID_ITEM + Item::ALL.len()).contains(&c) => new.toggle(Item::ALL[c - ID_ITEM]),
+        _ => return, // dismissed
+    }
+    apply_settings(hwnd, new, true);
+}
+
 /// Toggle move mode by flipping WS_EX_TRANSPARENT (click-through) on and off.
+/// Entering it also re-reads hwoverlay.ini, so edits made in Notepad take effect.
 unsafe fn set_move_mode(hwnd: HWND, on: bool) {
+    if on && !with_app(|app| app.moving) {
+        let mut loaded = config::load();
+        loaded.placement = with_app(|app| app.settings.placement);
+        apply_settings(hwnd, loaded, false);
+    }
     let changed = with_app(|app| {
         let changed = app.moving != on;
         app.moving = on;
@@ -338,7 +410,7 @@ unsafe fn drag_to_cursor(hwnd: HWND) {
     x = stick(stick(x, mon.left + m), mon.right - w - m);
     y = stick(stick(y, mon.top + m), mon.bottom - h - m);
 
-    with_app(|app| app.placement = Placement::Free { x, y });
+    with_app(|app| app.settings.placement = Placement::Free { x, y });
     let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
@@ -465,41 +537,179 @@ fn label(s: &str) -> (String, COLORREF) {
     (format!("{s:<5}"), LABEL)
 }
 
-fn build_lines(s: &Snapshot) -> Vec<Line> {
+fn build_lines(s: &Snapshot, cfg: &Settings) -> Vec<Line> {
+    let mut lines = if cfg.horizontal { vec![compact_line(s, cfg)] } else { column(s, cfg) };
+    lines.retain(|l| !l.is_empty());
+    if lines.is_empty() {
+        // Everything switched off: keep something visible to drag / right-click.
+        lines.push(vec![("hwoverlay".into(), DIM)]);
+    }
+    lines
+}
+
+fn temp_seg(t: Option<f64>) -> Option<(String, COLORREF)> {
+    t.map(|t| (format!(" {t:>3.0}°C"), temp_color(t.round() as u32)))
+}
+
+/// One item per line (the default layout).
+fn column(s: &Snapshot, cfg: &Settings) -> Vec<Line> {
     let mut lines = Vec::new();
 
-    let mut cpu = vec![label("CPU"), pct_seg(s.cpu_pct), watts_seg(s.cpu_watts)];
-    if let Some(t) = s.cpu_temp {
-        cpu.push((format!(" {:>3.0}°C", t), temp_color(t.round() as u32)));
+    if cfg.shows(Item::Cpu) {
+        let mut cpu = vec![label("CPU"), pct_seg(s.cpu_pct), watts_seg(s.cpu_watts)];
+        cpu.extend(temp_seg(s.cpu_temp));
+        lines.push(cpu);
     }
-    lines.push(cpu);
-
-    let mut gpu = vec![label("GPU"), pct_seg(s.gpu_pct), watts_seg(s.gpu_watts)];
-    if let Some(t) = s.gpu_temp {
-        gpu.push((format!(" {t:>3}°C"), temp_color(t)));
+    if cfg.shows(Item::Gpu) {
+        let mut gpu = vec![label("GPU"), pct_seg(s.gpu_pct), watts_seg(s.gpu_watts)];
+        gpu.extend(temp_seg(s.gpu_temp.map(f64::from)));
+        lines.push(gpu);
     }
-    lines.push(gpu);
-
-    if let Some((used, total)) = s.vram {
+    if let (true, Some((used, total))) = (cfg.shows(Item::Vram), s.vram) {
         lines.push(vec![label("VRAM"), pct_seg(Some(used / total * 100.0)), (format!(" {used:.1}/{total:.1}G"), DIM)]);
     }
-
-    lines.push(vec![
-        label("RAM"),
-        pct_seg(Some(s.ram_pct)),
-        (format!(" {:.1}/{:.1}G", s.ram_used_gb, s.ram_total_gb), DIM),
-    ]);
-
-    lines.push(vec![label("DL"), (rate(s.net_down), TEXT)]);
-    lines.push(vec![label("UL"), (rate(s.net_up), TEXT)]);
-
-    if s.cpu_watts.is_some() || s.gpu_watts.is_some() {
-        let total = s.cpu_watts.unwrap_or(0.0) + s.gpu_watts.unwrap_or(0.0);
-        lines.push(vec![label("PWR"), (format!("{total:>5.1}W"), WARN), (" CPU+GPU".into(), DIM)]);
+    if cfg.shows(Item::Ram) {
+        lines.push(vec![
+            label("RAM"),
+            pct_seg(Some(s.ram_pct)),
+            (format!(" {:.1}/{:.1}G", s.ram_used_gb, s.ram_total_gb), DIM),
+        ]);
     }
-    if let Some(w) = s.battery_watts {
-        lines.push(vec![label("BAT"), (format!("{w:>5.1}W"), WARN), (" system".into(), DIM)]);
+    if cfg.shows(Item::Net) {
+        lines.push(vec![label("DL"), (rate(s.net_down), TEXT)]);
+        lines.push(vec![label("UL"), (rate(s.net_up), TEXT)]);
     }
-
+    if cfg.shows(Item::Power) {
+        if s.cpu_watts.is_some() || s.gpu_watts.is_some() {
+            let total = s.cpu_watts.unwrap_or(0.0) + s.gpu_watts.unwrap_or(0.0);
+            lines.push(vec![label("PWR"), (format!("{total:>5.1}W"), WARN), (" CPU+GPU".into(), DIM)]);
+        }
+        if let Some(w) = s.battery_watts {
+            lines.push(vec![label("BAT"), (format!("{w:>5.1}W"), WARN), (" system".into(), DIM)]);
+        }
+    }
     lines
+}
+
+/// Network rate in at most 5 characters, e.g. ` 1.2M`, `  85K`, so the line keeps its width.
+fn compact_rate(bytes_per_sec: f64) -> String {
+    const K: f64 = 1024.0;
+    let s = if bytes_per_sec >= K * K { format!("{:.1}M", bytes_per_sec / (K * K)) } else { format!("{:.0}K", bytes_per_sec / K) };
+    format!("{s:>5}")
+}
+
+/// Everything on one short line: `CPU  23%  55°C │ GPU  41%  63°C │ RAM  48% │ ↓ 1.2M ↑  85K │ PWR  77W`.
+/// Detail (GB used, per-chip watts) is left out to keep it narrow.
+fn compact_line(s: &Snapshot, cfg: &Settings) -> Line {
+    let tag = |t: &str| (format!("{t} "), LABEL);
+    let mut groups: Vec<Line> = Vec::new();
+
+    if cfg.shows(Item::Cpu) {
+        let mut g = vec![tag("CPU"), pct_seg(s.cpu_pct)];
+        g.extend(temp_seg(s.cpu_temp));
+        groups.push(g);
+    }
+    if cfg.shows(Item::Gpu) {
+        let mut g = vec![tag("GPU"), pct_seg(s.gpu_pct)];
+        g.extend(temp_seg(s.gpu_temp.map(f64::from)));
+        groups.push(g);
+    }
+    if let (true, Some((used, total))) = (cfg.shows(Item::Vram), s.vram) {
+        groups.push(vec![tag("VRAM"), pct_seg(Some(used / total * 100.0))]);
+    }
+    if cfg.shows(Item::Ram) {
+        groups.push(vec![tag("RAM"), pct_seg(Some(s.ram_pct))]);
+    }
+    if cfg.shows(Item::Net) {
+        groups.push(vec![
+            ("↓".into(), LABEL),
+            (compact_rate(s.net_down), TEXT),
+            (" ↑".into(), LABEL),
+            (compact_rate(s.net_up), TEXT),
+        ]);
+    }
+    if cfg.shows(Item::Power) {
+        let mut g = Vec::new();
+        if s.cpu_watts.is_some() || s.gpu_watts.is_some() {
+            let total = s.cpu_watts.unwrap_or(0.0) + s.gpu_watts.unwrap_or(0.0);
+            g.extend([tag("PWR"), (format!("{total:>3.0}W"), WARN)]);
+        }
+        if let Some(w) = s.battery_watts {
+            g.extend([tag(if g.is_empty() { "BAT" } else { " BAT" }), (format!("{w:>3.0}W"), WARN)]);
+        }
+        groups.push(g);
+    }
+
+    groups.retain(|g| !g.is_empty());
+    let mut line = Line::new();
+    for (i, g) in groups.into_iter().enumerate() {
+        if i > 0 {
+            line.push((" │ ".into(), DIM));
+        }
+        line.extend(g);
+    }
+    line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(l: &Line) -> String {
+        l.iter().map(|(s, _)| s.as_str()).collect()
+    }
+
+    fn sample() -> Snapshot {
+        Snapshot {
+            cpu_pct: Some(23.0),
+            cpu_watts: Some(15.2),
+            cpu_temp: Some(55.0),
+            gpu_pct: Some(41.0),
+            gpu_watts: Some(62.0),
+            gpu_temp: Some(63),
+            vram: Some((2.0, 8.0)),
+            ram_pct: 48.0,
+            ram_used_gb: 7.6,
+            ram_total_gb: 16.0,
+            net_down: 1.2 * 1024.0 * 1024.0,
+            net_up: 85.0 * 1024.0,
+            battery_watts: None,
+        }
+    }
+
+    #[test]
+    fn compact_layout() {
+        let mut cfg = Settings::default();
+        cfg.horizontal = true;
+        let lines = build_lines(&sample(), &cfg);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            text(&lines[0]),
+            "CPU  23%  55°C │ GPU  41%  63°C │ VRAM  25% │ RAM  48% │ ↓ 1.2M ↑  85K │ PWR  77W"
+        );
+    }
+
+    #[test]
+    fn hidden_items_are_dropped() {
+        let mut cfg = Settings::default();
+        for item in [Item::Gpu, Item::Vram, Item::Net, Item::Power] {
+            cfg.toggle(item);
+        }
+        let column: Vec<String> = build_lines(&sample(), &cfg).iter().map(text).collect();
+        assert_eq!(column, ["CPU   23%  15.2W  55°C", "RAM   48% 7.6/16.0G"]);
+
+        cfg.horizontal = true;
+        assert_eq!(text(&build_lines(&sample(), &cfg)[0]), "CPU  23%  55°C │ RAM  48%");
+
+        cfg.toggle(Item::Cpu);
+        cfg.toggle(Item::Ram);
+        assert_eq!(text(&build_lines(&sample(), &cfg)[0]), "hwoverlay");
+    }
+
+    #[test]
+    fn compact_rate_is_fixed_width() {
+        for b in [0.0, 900.0, 85.0 * 1024.0, 999.0 * 1024.0, 1.2 * 1024.0 * 1024.0, 55.5 * 1024.0 * 1024.0] {
+            assert_eq!(compact_rate(b).chars().count(), 5, "{b}");
+        }
+    }
 }
